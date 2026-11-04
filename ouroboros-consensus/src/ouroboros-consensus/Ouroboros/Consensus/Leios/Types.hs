@@ -46,11 +46,17 @@ module Ouroboros.Consensus.Leios.Types
   , EndorserBlock -- opaque
   , TxOffset
   , TxLocation (..)
+  , MajorProtVerMod -- opaque
+  , majorProtVerMod
+  , majorProtVerModBits
+  , mkMajorProtVerMod
+  , unMajorProtVerMod
   , mkEndorserBlock
   , endorserBlockFromTxBytes
   , ForgedEndorserBlock
   , forgedEbBody
   , forgedEbTxs
+  , forgedEbTxsProtVer
   , forgeLeiosEb
   , endorserBlockHash
   , endorserBlockReferences
@@ -90,13 +96,14 @@ import Cardano.Crypto.Hash
   )
 import Cardano.Crypto.Leios (LeiosSeatId (..), LeiosSignature)
 import Cardano.Crypto.Util (SignableRepresentation (..))
-import Cardano.Ledger.BaseTypes (Milliseconds32 (..))
+import Cardano.Ledger.BaseTypes (Milliseconds32 (..), ProtVer (..))
 import Cardano.Ledger.Binary
   ( DecCBOR (..)
   , DecoderError (..)
   , EncCBOR (..)
   , Version
   , decodeFullAnnotator
+  , getVersion64
   , toPlainEncoding
   )
 import Cardano.Ledger.Binary.Plain (decodeRecordNamed)
@@ -123,6 +130,7 @@ import qualified Codec.CBOR.Encoding as CBOR
 import Codec.Serialise (Serialise (..))
 import Control.DeepSeq (NFData)
 import Control.Monad (when)
+import Data.Bits (bit, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
@@ -132,7 +140,7 @@ import Data.Maybe (fromMaybe)
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
 import Data.Time (NominalDiffTime)
-import Data.Word (Word32, Word64)
+import Data.Word (Word16, Word32, Word64)
 import GHC.Generics (Generic)
 import qualified GHC.IsList as IsList
 import NoThunks.Class (NoThunks)
@@ -335,18 +343,58 @@ data ForgedEndorserBlock = ForgedEndorserBlock
   , forgedEbTxs :: !(NonEmpty ByteString)
   -- ^ The bytes of the transactions that 'forgedEbBody' references, in the
   -- same order.
+  , forgedEbTxsProtVer :: !MajorProtVerMod
+  -- ^ The major protocol version the forge validated those transactions under.
   }
   deriving stock (Show, Eq)
 
 -- | The endorser block that references the given transactions, in the given
--- order. The reference to a transaction holds the Blake2b-256 hash and the
--- length of its bytes.
-forgeLeiosEb :: NonEmpty ByteString -> ForgedEndorserBlock
-forgeLeiosEb txBytes =
+-- order, validated under this major protocol version. The reference to a
+-- transaction holds the Blake2b-256 hash and the length of its bytes.
+forgeLeiosEb :: MajorProtVerMod -> NonEmpty ByteString -> ForgedEndorserBlock
+forgeLeiosEb protVer txBytes =
   ForgedEndorserBlock
     { forgedEbBody = endorserBlockFromTxBytes txBytes
     , forgedEbTxs = txBytes
+    , forgedEbTxsProtVer = protVer
     }
+
+-- | The major protocol version a tx was validated under, modulo 1024
+-- (@2 ^ 'majorProtVerModBits'@). The Mempool and LeiosVoting validate a tx
+-- only under the current major version, so a cached tx's validation still holds
+-- exactly when this matches the current version's.
+--
+-- Mistaking a stale validation for a current one would take 1024 major version
+-- changes while the tx stays cached. On a public net, this is very unlikely to
+-- happen: each protocol version usually gets its own software release, which
+-- requires a restart, which clears the LeiosTxCache. But it is /possible/ that
+-- a single release could handle multiple protocol versions beyond the chain's
+-- current protocol version as of that release. For example, a /new/ net /could/
+-- run the Cardano node starting from protocol version 0 and evolving /live/
+-- through all the subsequent protocol versions /without restarting/. So we
+-- tolerate 1024 such protocol versions, since it seems like it'll be a very
+-- long time before this software runs on a chain that has more protocol
+-- versions than that.
+newtype MajorProtVerMod = UnsafeMajorProtVerMod Word16
+  deriving stock (Show, Eq)
+  deriving newtype NoThunks
+
+-- | How many low bits of the major protocol version 'MajorProtVerMod' keeps.
+majorProtVerModBits :: Int
+majorProtVerModBits = 10
+
+-- | The major version of this protocol version, modulo
+-- @2 ^ 'majorProtVerModBits'@.
+majorProtVerMod :: ProtVer -> MajorProtVerMod
+majorProtVerMod = mkMajorProtVerMod . getVersion64 . pvMajor
+
+-- | This major protocol version number, modulo @2 ^ 'majorProtVerModBits'@.
+mkMajorProtVerMod :: Word64 -> MajorProtVerMod
+mkMajorProtVerMod v =
+  UnsafeMajorProtVerMod (fromIntegral (v .&. (bit majorProtVerModBits - 1)))
+
+unMajorProtVerMod :: MajorProtVerMod -> Word16
+unMajorProtVerMod (UnsafeMajorProtVerMod v) = v
 
 -- | The hash ranking blocks announce for the endorser block: that of its
 -- encoding.
