@@ -1,6 +1,6 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
@@ -18,6 +18,7 @@ module Ouroboros.Consensus.MiniProtocol.LeiosFetch.Client.Replies
   ( LeiosFetchClientContext (..)
   , ReplyOwnership (..)
   , requestReplyOwnership
+  , emitContextObservations
   , ExnLeiosFetchInvalidReply (..)
   , JobMismatch (..)
   , awaitTerminate
@@ -81,6 +82,7 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Client
   ( LeiosFetchJobActions (..)
   , SomeLeiosFetchJob (..)
   )
+import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.Coverage as Coverage
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
   ( AlreadyEmitted (..)
   , EbFetchState (..)
@@ -105,12 +107,16 @@ import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.RequestState as L
 import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.Runtime as R
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Trace
   ( FetchArrivalBytes
+  , FetchPhase (..)
+  , FetchRoutine (..)
   , TraceLeiosFetchClientEvent (..)
+  , TraceLeiosFetchDetailEvent (..)
   , fetchArrivalEvicted
   , fetchArrivalExtra
   , fetchArrivalGood
   , fetchArrivalInvalid
   )
+import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.Trace.Policy as A
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Type (Message (..), offsetsToBitmap)
 import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.Wait as W
 import Ouroboros.Consensus.Storage.LeiosDB.API
@@ -124,6 +130,7 @@ import Ouroboros.Consensus.Util.IOLike
   , IOLike
   , STM
   , StrictMVar
+  , Time
   , atomically
   , catch
   , evaluate
@@ -133,6 +140,7 @@ import Ouroboros.Consensus.Util.IOLike
   , modifyMVar
   , myThreadId
   , readMVar
+  , readTVar
   , retry
   , throwIO
   , throwTo
@@ -144,19 +152,49 @@ import Ouroboros.Network.ControlMessage (ControlMessage (..), ControlMessageSTM)
 -- The callbacks contain no payload, and cleanup affects only this attempt.
 data ReplyOwnership m = ReplyOwnership
   { claimUsefulReply :: STM m Bool
-  , acceptedReply :: STM m ()
-  , settledReceipt :: STM m ()
+  , acceptedReply :: Time -> BytesSize -> STM m (m ())
+  , settledReceipt :: Time -> STM m (m ())
   , abandonUnsubmitted :: STM m ()
   }
 
 requestReplyOwnership ::
-  (IOLike m, Ord peer) => R.Runtime m peer -> L.AttemptKey peer -> LeiosFetchRequest -> ReplyOwnership m
-requestReplyOwnership rt key req =
+  (IOLike m, Ord peer) =>
+  LeiosFetchClientContext m peer -> L.AttemptKey peer -> LeiosFetchRequest -> ReplyOwnership m
+requestReplyOwnership ctx key req =
   ReplyOwnership
-    (R.claimUseful rt key)
-    (R.acceptReply rt key (R.workOf req))
-    (R.settleReceipt rt key (R.workOf req))
-    (R.clearUnsubmitted rt key (R.workOf req))
+    { claimUsefulReply = R.claimUseful rt key
+    , acceptedReply = \at actual -> do
+        before <- readTVar (R.runtimeFacts rt)
+        let released = Map.member key (L.leases (R.ledger before))
+            useful = case Map.lookup (R.workOf req) (R.pending before) of
+              Just (R.NetworkOwner owner, False) -> owner == key
+              _ -> False
+            won = case R.workOf req of
+              L.Body{} | useful -> [A.Routine key (FetchBodyWon (A.requestSummaryOf key req) actual)]
+              _ -> []
+        R.acceptReply rt key (R.workOf req)
+        accepted <- A.transition rt key req FetchWriterAccepted at
+        refunded <- A.transition rt key req FetchResourceSettled at
+        let !events = A.forceObservations (won ++ [accepted] ++ [refunded | released])
+        pure (emitContextObservations ctx events)
+    , settledReceipt = \at -> do
+        R.settleReceipt rt key (R.workOf req)
+        event <- A.transition rt key req FetchReceiptSettled at
+        pure (emitContextObservations ctx [event])
+    , abandonUnsubmitted = R.clearUnsubmitted rt key (R.workOf req)
+    }
+ where
+  rt = lfcRuntime ctx
+
+-- | STM returns already-detached observations; emission follows the owning lock.
+emitContextObservations :: Monad m => LeiosFetchClientContext m peer -> [A.Observation peer] -> m ()
+emitContextObservations ctx = A.emitObservations (lfcTracer ctx) (lfcDetailTracer ctx)
+
+finishReplyReceipt :: IOLike m => ReplyOwnership m -> m ()
+finishReplyReceipt ownership = do
+  at <- getMonotonicTime
+  emit <- atomically (settledReceipt ownership at)
+  emit
 
 -- | What every LeiosFetch client of the node shares.
 data LeiosFetchClientContext m peer = MkLeiosFetchClientContext
@@ -175,6 +213,8 @@ data LeiosFetchClientContext m peer = MkLeiosFetchClientContext
   -- ^ Emit an acquisition to the rest of the node.
   , lfcSystemTime :: !(SystemTime m)
   -- ^ For reporting how long after its announcement an endorser block arrived.
+  , lfcDetailTracer :: !(Tracer m (TraceLeiosFetchDetailEvent peer))
+  -- ^ Independently suppressible request lifecycle observations.
   , lfcTracer :: !(Tracer m (TraceLeiosFetchClientEvent peer))
   }
 
@@ -257,36 +297,48 @@ nextLeiosFetchJob ctx client =
   peer = R.clientPeer client
   actions key req =
     LeiosFetchJobActions
-      { beforeDispatch = mask_ $ modifyMVar (lfcOutstanding ctx) $ \out -> do
-          let wanted = isFocusedPoint (point req) out && needed req out
-          if wanted
-            then do
-              dispatch <- atomically (R.commitRequest client key)
-              if dispatch
-                then pure (out, True)
-                else do
-                  atomically (R.discardAttempt rt key)
-                  pure (unpick req out, False)
-            else do
-              atomically (R.discardAttempt rt key)
-              pure (unpick req out, False)
+      { beforeDispatch = mask_ $ do
+          (dispatch, events) <- modifyMVar (lfcOutstanding ctx) $ \out -> do
+            now <- getMonotonicTime
+            let wanted = isFocusedPoint (point req) out && needed req out
+            dispatch <- if wanted then atomically (R.commitRequest client key) else pure False
+            if dispatch
+              then do
+                event <- atomically (A.transition rt key req FetchDispatchCommitted now)
+                pure (out, (True, [event]))
+              else do
+                event <- atomically $ R.discardAttempt rt key >> A.transition rt key req FetchObsoleteSkipped now
+                pure (unpick req out, (False, [event]))
+          emitContextObservations ctx events
+          pure dispatch
       , beforeReceive = atomically (R.installReceiver client key)
       , withReplyHandler = \action ->
           action `finally` do
             now <- getMonotonicTime
-            atomically (R.finishHandler client key (R.workOf req) now)
+            events <- atomically $ do
+              before <- readTVar (R.runtimeFacts rt)
+              let released = Map.member key (L.leases (R.ledger before))
+                  oldHead = A.headSummary peer before
+              R.finishHandler client key (R.workOf req) now
+              following <- readTVar (R.runtimeFacts rt)
+              finished <- A.transition rt key req FetchHandlerFinished now
+              refunded <- A.transition rt key req FetchResourceSettled now
+              pure $!
+                A.forceObservations
+                  ([refunded | released] ++ [finished] ++ A.headChanges oldHead (A.headSummary peer following))
+            emitContextObservations ctx events
       }
   toJob key req = case req of
     LeiosBlockRequest body ->
       MkSomeLeiosFetchJob
         (actions key req)
         (MsgLeiosBlockRequest (lbrPoint body))
-        (\(MsgLeiosBlock eb) -> processLeiosBlock (requestReplyOwnership rt key req) ctx peer body eb)
+        (\(MsgLeiosBlock eb) -> processLeiosBlock (requestReplyOwnership ctx key req) ctx peer body eb)
     LeiosBlockTxsRequest txReq@(MkLeiosBlockTxsRequest p jobs) ->
       MkSomeLeiosFetchJob
         (actions key req)
         (MsgLeiosBlockTxsRequest p (offsetsToBitmap (foldMap (\(Jobs.MkLeiosJob offs _ _) -> offs) jobs)))
-        (\(MsgLeiosBlockTxs txs) -> processLeiosBlockTxs (requestReplyOwnership rt key req) ctx peer txReq txs)
+        (\(MsgLeiosBlockTxs txs) -> processLeiosBlockTxs (requestReplyOwnership ctx key req) ctx peer txReq txs)
   point = L.workPoint . R.workOf
   needed req out = case Map.lookup (point req) (ebState out) of
     Just (MkEbState _ state) -> case (req, state) of
@@ -365,13 +417,15 @@ processLeiosBlock ownership ctx peer req bytes =
               BodyDiscarded arrival -> traceWith lfcTracer $ TraceLeiosFetchClientBlockArrived peer point arrival
               BodyToWrite localFills -> do
                 bodyWritten <- writeEbBody lfcWriter point eb (Map.fromList localFills) Map.empty
-                atomically (acceptedReply ownership)
+                acceptedAt <- getMonotonicTime
+                emitAccepted <- atomically (acceptedReply ownership acceptedAt ebBytesSize)
                 -- Acceptance transfers immediately, before later observations can fail.
                 Receipts.forkReceipt
                   (lfcReceiptTasks ctx)
                   ( settleBody ctx peer point eb now bodyWritten
-                      `finally` atomically (settledReceipt ownership)
+                      `finally` finishReplyReceipt ownership
                   )
+                emitAccepted
             when (ebBytesSize /= lbrOfferedSize req) $
               throwIO $
                 ExnLeiosBlockWrongSize point (lbrOfferedSize req) ebBytesSize
@@ -472,13 +526,24 @@ settleBody ctx peer point eb now bodyWritten = do
               when (Jobs.nullJobPool jobPool) $
                 lfcNotify $
                   AcquiredEbTxs point
+            let initialized =
+                  withInitialCoverage
+                    point
+                    (lebTxsSize (leiosEbByteSizes eb))
+                    (sum [fromIntegral (snd (refs IntMap.! offset)) | offset <- heldOffs])
+                    (acquireEbBody point jobPool outstanding)
+                (updated, summary) =
+                  if Jobs.nullJobPool jobPool
+                    then finishPointCoverage point False initialized
+                    else (initialized, Nothing)
             pure
-              ( acquireEbBody point jobPool outstanding
+              ( updated
               , first
                   : TraceLeiosFetchClientBlockAcquired point (ageAt now onset)
                   : [ TraceLeiosFetchClientBlockTxsAcquired point (ageAt now onset)
                     | Jobs.nullJobPool jobPool
                     ]
+                  ++ [TraceLeiosFetchClientClosureSummary point value | Just value <- [summary]]
               )
       -- These bytes are durable now: advertise them as fill sources for later
       -- endorser blocks referencing the same txs.
@@ -566,8 +631,23 @@ settleForgedEb ctx point eb now version written = do
               Just EmittedBody -> ([AcquiredEbTxs point], [TraceLeiosFetchClientBlockTxsAcquired point age])
               Just EmittedBodyAndClosure -> ([], [])
               Nothing -> ([], [])
+        let complete = IntMap.keysSet refs `IntSet.isSubsetOf` IntSet.fromList heldOffs
+            mayFinish = not (null notifications) && complete
+            initialized =
+              if Map.member point (closureCoverage outstanding')
+                then outstanding'
+                else
+                  outstanding'
+                    { closureCoverage =
+                        Map.insert
+                          point
+                          (Coverage.beginForgedCoverage (lebTxsSize (leiosEbByteSizes eb)))
+                          (closureCoverage outstanding')
+                    }
+            (updated, summary) = if mayFinish then finishPointCoverage point True initialized else (outstanding', Nothing)
         atomically $ mapM_ lfcNotify notifications
-        pure (outstanding', traces)
+        pure
+          (updated, traces ++ [TraceLeiosFetchClientClosureSummary point value | Just value <- [summary]])
       -- These bytes are durable now: advertise them as fill sources for later
       -- endorser blocks referencing the same txs.
       recordConfirmedBodyTxs lfcTxCache point refs (Map.fromList [(h, version) | (h, _size) <- IntMap.elems refs]) (Set.fromList heldOffs)
@@ -661,12 +741,21 @@ processLeiosBlockTxs ownership ctx peer req@(MkLeiosBlockTxsRequest point jobs) 
               if claimed
                 then mempty
                 else fetchArrivalExtra (sum [fromIntegral (BS.length bytes) | (_, _, bytes) <- validated])
-        metadata <- evaluate $ IntMap.fromList
-          [(off, (h, size)) | (off, !h, bytes) <- toIngest, let !size = fromIntegral (BS.length bytes)]
-        arrival <- classifyTxs lfcTxCache point (IntMap.elems metadata)
+        let !metadata =
+              IntMap.fromList
+                [(off, VerifiedTx txHash (fromIntegral (BS.length bytes))) | (off, txHash, bytes) <- toIngest]
+        arrival <- classifyTxs lfcTxCache point
+          [(h, size) | VerifiedTx h size <- IntMap.elems metadata]
         owner <- myThreadId
         txsWritten <- writeTxs lfcWriter point (Map.fromList [(off, bytes) | (off, _txHash, bytes) <- toIngest])
-        atomically (acceptedReply ownership)
+        acceptedAt <- getMonotonicTime
+        emitAccepted <-
+          atomically
+            ( acceptedReply
+                ownership
+                acceptedAt
+                (sum [fromIntegral (BS.length bytes) | (_, _, bytes) <- toIngest])
+            )
         -- The writer accepted this immutable job. Its node-owned callback survives
         -- subsequent cache/tracer waits and peer death. Protocol faults retain the
         -- original connection owner; storage failures go to node supervision.
@@ -674,7 +763,8 @@ processLeiosBlockTxs ownership ctx peer req@(MkLeiosBlockTxsRequest point jobs) 
           ( settleTxs ctx peer req now metadata txsWritten
               `catch` \(fault :: ExnLeiosFetchInvalidReply) -> throwTo owner fault
           )
-            `finally` atomically (settledReceipt ownership)
+            `finally` finishReplyReceipt ownership
+        emitAccepted
         traceWith lfcTracer $
           TraceLeiosFetchClientTxsArrived peer point (arrival <> discarded <> pendingExtra)
         atomically $ W.notifyReadiness lfcReady
@@ -724,7 +814,7 @@ settleTxs ::
   -- | when the txs arrived
   RelativeTime ->
   -- | the offsets and hashes of the txs written
-  IntMap.IntMap (TxHash, BytesSize) ->
+  IntMap.IntMap VerifiedTx ->
   -- | explicit confirmation after the transaction write commits
   Promise m TxWriteReceipt ->
   m ()
@@ -732,7 +822,16 @@ settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) now written txsWritt
   receipt <- await txsWritten
   let wrongSize = toIntSet (txWriteWrongSize receipt)
   completed <- modifyMVar lfcOutstanding $ \outstanding -> do
-    let outstanding' = settleTxRequest peer req (toIntSet (txWriteConfirmed receipt)) outstanding
+    let confirmedSizes =
+          IntMap.map (\(VerifiedTx _ bytes) -> bytes) (IntMap.restrictKeys written (toIntSet (txWriteConfirmed receipt)))
+        observed = case Map.lookup point (ebState outstanding) of
+          Just (MkEbState _ BodyAcquired{}) ->
+            outstanding
+              { closureCoverage =
+                  Map.update (Coverage.confirmNetwork confirmedSizes) point (closureCoverage outstanding)
+              }
+          _ -> outstanding
+        outstanding' = settleTxRequest peer req (toIntSet (txWriteConfirmed receipt)) observed
     case (Map.lookup point (ebState outstanding), Map.lookup point (ebState outstanding')) of
       _
         | not (IntSet.null wrongSize) ->
@@ -744,17 +843,18 @@ settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) now written txsWritt
           , not (Jobs.nullJobPool before)
           , Jobs.nullJobPool after -> do
               atomically $ lfcNotify $ AcquiredEbTxs point
-              pure (outstanding', Just onset)
+              let (updated, summary) = finishPointCoverage point False outstanding'
+              pure (updated, Just (onset, summary))
       _ -> pure (outstanding', Nothing)
   -- These bytes are durable now: advertise them as fill sources for later
   -- endorser blocks referencing the same txs.
   void $ withInsertLandedTx lfcTxCache point $ \nil step ->
-    foldM (\acc (off, (h, size)) -> step acc off h size (TxInserted ())) nil
+    foldM (\acc (off, VerifiedTx h size) -> step acc off h size (TxInserted ())) nil
       (IntMap.toAscList (IntMap.restrictKeys written (toIntSet (txWriteConfirmed receipt))))
   atomically $ W.notifyReadiness lfcReady
-  forM_ completed $ \onset ->
-    traceWith lfcTracer $
-      TraceLeiosFetchClientBlockTxsAcquired point (ageAt now onset)
+  forM_ completed $ \(onset, summary) -> do
+    traceWith lfcTracer $ TraceLeiosFetchClientBlockTxsAcquired point (ageAt now onset)
+    forM_ summary $ \value -> traceWith lfcTracer (TraceLeiosFetchClientClosureSummary point value)
   -- The receipt owner forwards this protocol fault to the original client,
   -- if it still runs; storage failures instead reach node supervision.
   unless (IntSet.null wrongSize) $
@@ -821,6 +921,28 @@ checkJobCommitment point aligned jid (Jobs.MkLeiosJob offs _expectedBytes commit
     [ (off, hashLeiosTx tx, leiosTxBytes tx)
     | (off, tx) <- IntMap.toAscList (IntMap.restrictKeys aligned offs)
     ]
+
+-- | Strict, payload-free callback metadata. Retaining a lazy projection from
+-- the received vector here would keep its bytes alive through the DB receipt.
+data VerifiedTx = VerifiedTx !TxHash !BytesSize
+
+withInitialCoverage ::
+  LeiosPoint -> Word64 -> Word64 -> LeiosOutstanding peer -> LeiosOutstanding peer
+withInitialCoverage point total local out =
+  out
+    { closureCoverage = case Coverage.beginCoverage total local of
+        Nothing -> Map.delete point (closureCoverage out)
+        Just value -> Map.insert point value (closureCoverage out)
+    }
+
+finishPointCoverage ::
+  LeiosPoint ->
+  Bool ->
+  LeiosOutstanding peer ->
+  (LeiosOutstanding peer, Maybe Coverage.ClosureSummary)
+finishPointCoverage point forged out = case Map.lookup point (closureCoverage out) >>= Coverage.finishCoverage forged of
+  Nothing -> (out, Nothing)
+  Just (summary, updated) -> (out{closureCoverage = Map.insert point updated (closureCoverage out)}, Just summary)
 
 toIntSet :: Set.Set TxOffset -> IntSet.IntSet
 toIntSet = IntSet.fromList . Set.toAscList
