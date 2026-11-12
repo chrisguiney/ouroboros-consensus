@@ -39,6 +39,7 @@ module Ouroboros.Consensus.Leios.TxCache
   , nullLeiosTxCache
   ) where
 
+import Data.Foldable (foldl')
 import Data.Maybe.Strict (StrictMaybe (SNothing))
 import qualified Data.Set as Set
 import Ouroboros.Consensus.Leios.TxCache.API
@@ -77,6 +78,8 @@ newPureLeiosTxCache nshift = do
             mapM_ evaluate summary
             _ <- evaluate w
             pure (idx', (summary, w))
+      , classifyTxs = \point txs ->
+          MVar.withMVar var $ \idx -> evaluate $ Pure.classifyTxs point txs idx
       , withInsertLandedTx = \point k ->
           MVar.modifyMVar var $ \idx ->
             k
@@ -102,6 +105,8 @@ nullLeiosTxCache =
   LeiosTxCache
     { evictOlderThanFoldl' = \_boundary nil _snoc -> pure (Set.empty, nil)
     , insertBodyAndFoldl' = \_point _b nil _snoc -> pure (Nothing, nil)
+    , classifyTxs = \_point txs ->
+        pure $! foldl' (\acc (_txh, size) -> acc <> bucketTxArrival TxEvicted size) mempty txs
     , withInsertLandedTx = \_point k ->
         k mempty (\fab _off _txh sz _payload -> pure (fab <> bucketTxArrival TxEvicted sz))
     , withLookupTx = \k -> k (\_txh -> pure SNothing)

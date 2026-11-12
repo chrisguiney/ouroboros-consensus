@@ -21,7 +21,7 @@ import Control.Monad (foldM, void)
 import Data.Bits (shiftR)
 import qualified Data.ByteString.Short as SBS
 import qualified Data.List as List
-import Data.Maybe.Strict (StrictMaybe, isSJust)
+import Data.Maybe.Strict (StrictMaybe (..), isSJust)
 import Data.Set (Set)
 import Data.Word (Word64, Word8)
 import Ouroboros.Consensus.Leios.TxCache
@@ -32,6 +32,7 @@ import Ouroboros.Consensus.Leios.TxCache
   , evictOlderThan
   , insertBody
   , newPureLeiosTxCache
+  , nullLeiosTxCache
   )
 import Ouroboros.Consensus.Leios.TxCache.Optimized (newHashTableLeiosTxCache)
 import Ouroboros.Consensus.Leios.Types
@@ -44,7 +45,12 @@ import Ouroboros.Consensus.Leios.Types
   , TxOffset
   , mkMajorProtVerMod
   )
-import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Trace (FetchArrivalBytes)
+import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Trace
+  ( FetchArrivalBytes
+  , fetchArrivalGood
+  , fetchArrivalExtra
+  , fetchArrivalEvicted
+  )
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Consensus.Leios.TxCache.Optimized.MutableHashTable
   ( Config (..)
@@ -83,6 +89,19 @@ tests =
         testProperty "hash-table handle == pure handle" prop_equiv
     , adjustOption (\(QuickCheckTests n) -> QuickCheckTests (n * 10)) $
         testProperty "hash-table handle == pure handle, with evictOlderThan" prop_equivEvict
+    , testGroup "point lifetime boundaries"
+        [ testCase name (testPointLifetime makeCache)
+        | (name, makeCache) <-
+            [("reference", newPureLeiosTxCache 8), ("optimized", newHashTableLeiosTxCache 8 salt0 salt1)]
+        ]
+    , testGroup "read-only arrival snapshots"
+        [ testCase name (testClassification makeCache)
+        | (name, makeCache) <-
+            [("reference", newPureLeiosTxCache 8), ("optimized", newHashTableLeiosTxCache 8 salt0 salt1)]
+        ]
+    , testCase "null cache classifies every occurrence as evicted" $ do
+        classifyTxs (nullLeiosTxCache :: H) (pointAt 1 1) [(txhOf 1, 10), (txhOf 1, 10)]
+          >>= (@?= fetchArrivalEvicted 20)
     , testCase
         "a thread killed while inserting a body leaves no tx behind once the body's point is evicted"
         $ killedInsertLeaks >>= (@?= 0)
@@ -115,6 +134,7 @@ data Op
   | -- | Land these txs, each the one EB @e@'s body lists at its offset, at the
     -- EB's point at a slot.
     OpLand !Word64 !Word8 ![(TxOffset, Word8, TxState () MajorProtVerMod)]
+  | OpClassify !Word64 !Word8 ![Word8]
   | OpEvict !Word64
   deriving Show
 
@@ -122,6 +142,7 @@ data Op
 data Observed
   = ObservedBody !(Maybe LeiosTxCacheInsertBodySummary) ![(TxOffset, Maybe TxLocation)]
   | ObservedLanded !FetchArrivalBytes
+  | ObservedClassified !FetchArrivalBytes
   | -- | The evicted points, and the forgotten txs in the order they were visited.
     ObservedEvicted !(Set LeiosPoint) ![TxHash]
   deriving (Eq, Show)
@@ -142,6 +163,8 @@ applyOp h = \case
         h
         (pointAt s e)
         (\z step -> foldM (\acc (off, t, payload) -> step acc off (txhOf t) (szOf t) payload) z landings)
+  OpClassify s e ts ->
+    ObservedClassified <$> classifyTxs h (pointAt s e) [(txhOf t, szOf t) | t <- ts]
   OpEvict boundary ->
     (\(points, txs) -> ObservedEvicted points (reverse txs))
       <$> evictOlderThanFoldl' h (SlotNo boundary) [] (flip (:))
@@ -188,6 +211,7 @@ genOps txDomain = do
     frequency
       [ (1, pure (bodyAt (s, e)))
       , (4, OpLand s e <$> (traverse landing =<< sublistOf (zip [0 ..] (txsOf e))))
+      , (2, OpClassify s e <$> sublistOf (txsOf e))
       ]
   shuffle (map bodyAt pool ++ others)
  where
@@ -279,3 +303,55 @@ killedInsertLeaks = do
   txhOfInt :: Int -> TxHash
   txhOfInt n =
     UnsafeHash $ SBS.pack ([fromIntegral (n `shiftR` (8 * i)) | i <- [0 .. 3]] ++ replicate 28 0)
+
+-- | Repeated registration does not change retention; younger references keep
+-- held state after the source point is evicted, but cannot keep its location.
+testPointLifetime :: IO H -> IO ()
+testPointLifetime makeCache = do
+  cache <- makeCache
+  let old = pointAt 1 1
+      shared = pointAt 128 1
+      lastPoint = pointAt 129 129
+      insert point refs = void $ insertBody cache point (TestBody refs)
+      look tx = withLookupTx cache ($ tx)
+  insert old [txhOf 1, txhOf 2]
+  insert old [txhOf 1, txhOf 2]
+  void $ withInsertLandedTx cache old $ \nil step ->
+    foldM (\acc (off, t) -> step acc off (txhOf t) 1 (TxInserted ())) nil [(0, 1), (1, 2)]
+  insert shared [txhOf 1, txhOf 2]
+  mapM_ (\n -> insert (pointAt (fromIntegral n) n) []) [2 .. 127]
+  insert lastPoint [txhOf 1, txhOf 3]
+  classifyTxs cache old [(txhOf 2, 1)] >>= (@?= fetchArrivalEvicted 1)
+  look (txhOf 2) >>= (@?= SJust (TxInserted ()))
+  evictOlderThan cache 129
+  look (txhOf 1) >>= (@?= SJust (TxInserted ()))
+  look (txhOf 2) >>= (@?= SNothing)
+  evictOlderThan cache 130
+  look (txhOf 1) >>= (@?= SNothing)
+
+-- | Classification neither inserts missing occurrences nor changes existing
+-- validation. An unretained point is evicted even when a newer point keeps X.
+testClassification :: IO H -> IO ()
+testClassification makeCache = do
+  cache <- makeCache
+  let p = pointAt 1 1
+      q = pointAt 2 2
+      body = TestBody [txhOf 1, txhOf 2]
+      batch = [(txhOf 1, 10), (txhOf 2, 10), (txhOf 2, 10)]
+      version = mkMajorProtVerMod 10
+  void $ insertBody cache p body
+  classifyTxs cache p batch >>= (@?= fetchArrivalGood 30)
+  sweepLookup cache [1, 2] >>= (@?= [SNothing, SNothing])
+  void $ withInsertLandedTx cache p $ \nil step -> step nil 0 (txhOf 1) 10 (TxValidated version)
+  before <- sweepLookup cache [1, 2]
+  classifyTxs cache p batch >>= (@?= fetchArrivalExtra 10 <> fetchArrivalGood 20)
+  classifyTxs cache p [] >>= (@?= mempty)
+  sweepLookup cache [1, 2] >>= (@?= before)
+  void $ withInsertLandedTx cache p $ \nil step -> step nil 0 (txhOf 1) 10 (TxInserted ())
+  sweepLookup cache [1, 2] >>= (@?= [SJust (TxValidated version), SNothing])
+  void $ insertBody cache q body
+  evictOlderThan cache 2
+  classifyTxs cache p batch >>= (@?= fetchArrivalEvicted 30)
+  classifyTxs cache q batch >>= (@?= fetchArrivalExtra 10 <> fetchArrivalGood 20)
+  void $ withInsertLandedTx cache p $ \nil step -> step nil 1 (txhOf 2) 10 (TxInserted ())
+  sweepLookup cache [1, 2] >>= (@?= [SJust (TxValidated version), SNothing])
