@@ -23,14 +23,12 @@ module Ouroboros.Consensus.MiniProtocol.LeiosFetch.Client.Replies
   , processLeiosBlock
   , processLeiosBlockTxs
   , acquireForgedEb
-  , noMempoolTxs
   ) where
 
 import Cardano.Ledger.Binary (DecoderError)
 import Cardano.Ledger.Dijkstra (DijkstraEra)
 import Control.Monad (foldM, unless, void, when)
 import Control.Tracer (Tracer, traceWith)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Data.Foldable (fold, toList)
@@ -101,11 +99,11 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
   , refundEbRequest
   , refundTxRequest
   )
+import Ouroboros.Consensus.MiniProtocol.LeiosFetch.LocalReuse (LocalReuse, reuseMempool)
+import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.ReceiptTasks as Receipts
 import qualified Ouroboros.Consensus.MiniProtocol.LeiosFetch.Jobs as Jobs
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Trace
   ( FetchArrivalBytes
-  , LeiosBlockTxSources (..)
-  , LeiosTxCacheInsertBodySummary
   , TraceLeiosFetchClientEvent (..)
   , fetchArrivalEvicted
   , fetchArrivalExtra
@@ -127,6 +125,10 @@ import Ouroboros.Consensus.Util.IOLike
   , StrictMVar
   , StrictTVar
   , atomically
+  , catch
+  , myThreadId
+  , throwTo
+  , readMVar
   , evaluate
   , modifyMVar
   , readTVar
@@ -144,15 +146,16 @@ data LeiosFetchClientContext m peer = MkLeiosFetchClientContext
   , lfcReady :: !(StrictMVar m ())
   -- ^ Filled by anything that might unblock a new fetch decision.
   , lfcTxCache :: !(LeiosTxCache m () MajorProtVerMod PackedEndorserBlock)
+  , lfcReceiptTasks :: !(Receipts.ReceiptTasks m)
+  -- ^ Node-owned accepted callbacks, independent of peer lifetime.
+  , lfcLocalReuse :: !(LocalReuse m)
+  -- ^ One bounded local discovery pass after the database fills.
   , lfcWriter :: !(LeiosDbWriter m)
   , lfcNotify :: !(LeiosAcquisition -> STM m ())
   -- ^ Emit an acquisition to the rest of the node.
   , lfcSystemTime :: !(SystemTime m)
   -- ^ For reporting how long after its point's slot began an endorser block,
   -- or its transactions, were acquired.
-  , lfcMempoolTxs :: !(Set TxHash -> m (Map TxHash (ByteString, MajorProtVerMod)))
-  -- ^ The bytes of those of these txs the node's mempool holds, and the major
-  -- protocol version it validated them under.
   , lfcTracer :: !(Tracer m (TraceLeiosFetchClientEvent peer))
   }
 
@@ -274,7 +277,7 @@ processLeiosBlock ::
   LeiosBlockRequest ->
   Serialised EndorserBlock ->
   m ()
-processLeiosBlock ctx peer req bytes = do
+processLeiosBlock ctx peer req bytes = Receipts.withReceiptSubmission (lfcReceiptTasks ctx) $ do
   when (hashSerialisedEndorserBlock bytes /= requestedEbHash) $ do
     traceWith lfcTracer $
       TraceLeiosFetchClientBlockArrived peer point (fetchArrivalInvalid ebBytesSize)
@@ -305,9 +308,9 @@ processLeiosBlock ctx peer req bytes = do
           -- Register the body's transactions in the tx cache, and read where
           -- some recent point holds any of them, so that the body
           -- write copies those rather than us fetching them again.
-          (summary, fills) <-
+          (_summary, fills) <-
             insertBodyAndFoldl' lfcTxCache point (packEndorserBlock eb) Map.empty snocLocated
-          pure (cleaned, BodyToWrite eb fills summary)
+          pure (cleaned, BodyToWrite eb fills)
   void $ tryPutMVar lfcReady ()
   case disposition of
     BodyTooBig exn -> do
@@ -315,12 +318,11 @@ processLeiosBlock ctx peer req bytes = do
         TraceLeiosFetchClientBlockArrived peer point (fetchArrivalInvalid ebBytesSize)
       throwIO exn
     BodyDiscarded arrival -> traceWith lfcTracer $ TraceLeiosFetchClientBlockArrived peer point arrival
-    BodyToWrite eb localFills summary -> do
-      -- Settled only once the write lands, since the settle needs the offsets
-      -- the point then holds. The client takes no other reply from this peer
-      -- meanwhile.
-      (written, validated) <- writeBodyWithLocalTxs ctx point eb localFills summary
-      settleBody ctx peer point eb validated written
+    BodyToWrite eb localFills -> do
+      written <- writeEbBody (lfcWriter ctx) point eb localFills Map.empty
+      Receipts.forkReceipt
+        (lfcReceiptTasks ctx)
+        (settleBody ctx peer point eb Map.empty written)
   -- Checked last, so that the body is still taken: throwing it away would let
   -- a peer deny us an endorser block just by lowballing its own offer.
   when (ebBytesSize /= lbrOfferedSize req) $
@@ -357,8 +359,7 @@ data BodyDisposition
   | -- | No longer wanted, its bytes classified so.
     BodyDiscarded !FetchArrivalBytes
   | -- | Wanted, so written, with these fills, and traced once that settles.
-    -- Also the LeiosTxCache's summary of taking it in, if it did.
-    BodyToWrite !EndorserBlock !LocalFills !(Maybe LeiosTxCacheInsertBodySummary)
+    BodyToWrite !EndorserBlock !LocalFills
 
 -- | Record the body as acquired at its point, now that its write has settled
 -- and holds the txs at these offsets,
@@ -385,7 +386,10 @@ settleBody ctx peer point eb validated bodyWritten = do
   receipt <- await bodyWritten
   case receipt of
     BodyUnavailable -> void $ tryPutMVar lfcReady ()
-    BodyPresent heldOffs -> do
+    BodyPresent confirmed -> do
+      held <- reuseMempool (lfcLocalReuse ctx) stillNeeded point
+        (toIntSet confirmed) (zip [0 ..] (endorserBlockReferences eb))
+      let heldOffs = Set.fromList (IntSet.toAscList held)
       traces <- modifyMVar lfcOutstanding $ \outstanding ->
         case Map.lookup point (ebState outstanding) of
           Nothing -> pure (outstanding, \_now -> [arrived fetchArrivalEvicted])
@@ -424,64 +428,14 @@ settleBody ctx peer point eb validated bodyWritten = do
     , lfcSystemTime
     , lfcTracer
     } = ctx
+  stillNeeded = do
+    outstanding <- readMVar lfcOutstanding
+    pure $ case Map.lookup point (ebState outstanding) of
+      Just (MkEbState _ NoBody) -> True
+      _ -> False
   refs = IntMap.fromList (zip [0 ..] (endorserBlockReferences eb))
   arrived bucket =
     TraceLeiosFetchClientBlockArrived peer point (bucket (encodeEndorserBlockSize eb))
-
--- | Write the body at this point together with those of its txs the node holds
--- locally, so that it fetches none of them: those the LeiosDB holds at other
--- points (the 'LocalFills'), and those its mempool holds. A tx the mempool holds is
--- written from there rather than filled, since taking it from the mempool also
--- records it in the LeiosTxCache as validated.
---
--- Returns the real write promise and compact captured validation facts.
--- Only the positive receipt establishes held offsets.
---
--- It traces where the txs come from, along with the LeiosTxCache's summary of
--- taking the body in, if it did.
-writeBodyWithLocalTxs ::
-  IOLike m =>
-  LeiosFetchClientContext m peer ->
-  LeiosPoint ->
-  EndorserBlock ->
-  LocalFills ->
-  Maybe LeiosTxCacheInsertBodySummary ->
-  m (Promise m BodyWriteReceipt, Map TxHash MajorProtVerMod)
-writeBodyWithLocalTxs ctx point eb localFills summary = do
-  inMempool <- lfcMempoolTxs (Set.fromList (map fst refs))
-  let fromMempool =
-        [ (off, txHash, bytes, protVer)
-        | (off, (txHash, _size)) <- zip [0 ..] refs
-        , Just (bytes, protVer) <- [Map.lookup txHash inMempool]
-        ]
-      mempoolOffs = Set.fromList [off | (off, _, _, _) <- fromMempool]
-      fills = localFills `Map.withoutKeys` mempoolOffs
-  traceWith lfcTracer $
-    TraceLeiosFetchClientBlockTxSources
-      point
-      MkLeiosBlockTxSources
-        { btsLocalFills = length fills
-        , btsMempool = length fromMempool
-        , btsRemaining = length refs - length fills - length fromMempool
-        }
-      summary
-  validated <- evaluate $ Map.fromList [(h, v) | (_off, h, _bytes, v) <- fromMempool]
-  written <-
-    writeEbBody
-      lfcWriter
-      point
-      eb
-      fills
-      (Map.fromList [(off, bytes) | (off, _txHash, bytes, _protVer) <- fromMempool])
-  pure (written, validated)
-
- where
-  MkLeiosFetchClientContext{lfcMempoolTxs, lfcWriter, lfcTracer} = ctx
-  refs = endorserBlockReferences eb
-
--- | 'lfcMempoolTxs' for a node that takes no txs from a mempool.
-noMempoolTxs :: Applicative m => Set TxHash -> m (Map TxHash (ByteString, MajorProtVerMod))
-noMempoolTxs _ = pure Map.empty
 
 -- | Acquire an endorser block the node's own forge produced in this election,
 -- as one that arrived with no peer: take its body into the LeiosTxCache, write
@@ -500,11 +454,11 @@ acquireForgedEb ::
   LeiosPoint ->
   ForgedEndorserBlock ->
   m ()
-acquireForgedEb ctx point forged = do
+acquireForgedEb ctx point forged = Receipts.withReceiptSubmission (lfcReceiptTasks ctx) $ do
   _ <- insertBody lfcTxCache point (packEndorserBlock eb)
   version <- evaluate (forgedEbTxsProtVer forged)
   written <- writeEbBody lfcWriter point eb mempty (Map.fromList (zip [0 ..] (toList (forgedEbTxs forged))))
-  settleForgedEb ctx point eb version written
+  Receipts.forkReceipt (lfcReceiptTasks ctx) $ settleForgedEb ctx point eb version written
  where
   MkLeiosFetchClientContext{lfcTxCache, lfcWriter} = ctx
   eb = forgedEbBody forged
@@ -588,7 +542,8 @@ processLeiosBlockTxs ::
   LeiosBlockTxsRequest ->
   V.Vector LeiosTx ->
   m ()
-processLeiosBlockTxs ctx peer req@(MkLeiosBlockTxsRequest point jobs) txs = do
+processLeiosBlockTxs ctx peer req@(MkLeiosBlockTxsRequest point jobs) txs = Receipts.withReceiptSubmission (lfcReceiptTasks ctx) $ do
+  now <- systemTimeCurrent (lfcSystemTime ctx)
   -- Cheap checks, without hashing, of the whole reply and of every covered
   -- job, so that an over-send is caught and punished even for a job we have
   -- since completed.
@@ -631,8 +586,14 @@ processLeiosBlockTxs ctx peer req@(MkLeiosBlockTxsRequest point jobs) txs = do
   metadata <- evaluate $ IntMap.fromList
     [(off, (h, size)) | (off, !h, bytes) <- toIngest, let !size = fromIntegral (BS.length bytes)]
   arrival <- classifyTxs lfcTxCache point [(h, size) | (h, size) <- IntMap.elems metadata]
+  owner <- myThreadId
   written <- writeTxs lfcWriter point (Map.fromList [(off, bytes) | (off, _h, bytes) <- toIngest])
-  settleTxs ctx peer req metadata (arrival <> discarded) written
+  -- Transfer accepted writes before tracing or cache work can fail. Only
+  -- compact hashes/sizes, not payloads, accompany this node-owned receipt.
+  Receipts.forkReceipt (lfcReceiptTasks ctx) $
+    settleTxs ctx peer req now metadata written
+      `catch` \(fault :: ExnLeiosFetchInvalidReply) -> throwTo owner fault
+  traceWith lfcTracer $ TraceLeiosFetchClientTxsArrived peer point (arrival <> discarded)
 
  where
   MkLeiosFetchClientContext
@@ -657,8 +618,8 @@ processLeiosBlockTxs ctx peer req@(MkLeiosBlockTxsRequest point jobs) txs = do
     throwIO exn
 
 -- | Retire the jobs of the request, now that the write of their txs is durable,
--- emit 'AcquiredEbTxs' if no job of the point remains, and trace the reply's
--- arrival, as classified when it arrived.
+-- record their confirmed cache locations, and emit 'AcquiredEbTxs' if no job
+-- of the point remains. Arrival counters were captured before writer admission.
 --
 -- See 'settleBody' on the LeiosDB's GC overtaking the fetch state's pruning.
 settleTxs ::
@@ -666,11 +627,11 @@ settleTxs ::
   LeiosFetchClientContext m peer ->
   peer ->
   LeiosBlockTxsRequest ->
+  RelativeTime ->
   IntMap.IntMap (TxHash, BytesSize) ->
-  FetchArrivalBytes ->
   Promise m TxWriteReceipt ->
   m ()
-settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) written arrival txsWritten = do
+settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) now written txsWritten = do
   receipt <- await txsWritten
   let confirmed = toIntSet (txWriteConfirmed receipt)
       wrongSize = txWriteWrongSize receipt
@@ -683,7 +644,7 @@ settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) written arrival txsW
         , not (Jobs.nullJobPool before)
         , Jobs.nullJobPool after -> do
             atomically $ lfcNotify $ AcquiredEbTxs point
-            pure (outstanding', \now -> [TraceLeiosFetchClientBlockTxsAcquired point (ageAt now onset)])
+            pure (outstanding', \settledAt -> [TraceLeiosFetchClientBlockTxsAcquired point (ageAt settledAt onset)])
       _ -> pure (outstanding', const [])
   void $ withInsertLandedTx lfcTxCache point $ \nil step ->
     foldM
@@ -691,12 +652,11 @@ settleTxs ctx peer req@(MkLeiosBlockTxsRequest point _jobs) written arrival txsW
       nil
       (IntMap.toAscList (IntMap.restrictKeys written confirmed))
   void $ tryPutMVar lfcReady ()
-  now <- systemTimeCurrent lfcSystemTime
-  mapM_ (traceWith lfcTracer) (TraceLeiosFetchClientTxsArrived peer point arrival : traces now)
+  mapM_ (traceWith lfcTracer) (traces now)
   unless (Set.null wrongSize) $
     throwIO $ ExnLeiosBlockTxsWrongSize point (Set.toAscList wrongSize)
  where
-  MkLeiosFetchClientContext{lfcOutstanding, lfcReady, lfcTxCache, lfcNotify, lfcSystemTime, lfcTracer} = ctx
+  MkLeiosFetchClientContext{lfcOutstanding, lfcReady, lfcTxCache, lfcNotify, lfcTracer} = ctx
 
 -- | The total size of these jobs' txs.
 jobsBytesSize :: IntMap.IntMap Jobs.LeiosJob -> BytesSize
