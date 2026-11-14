@@ -99,7 +99,8 @@ import Ouroboros.Consensus.Leios.Types
   )
 import Ouroboros.Consensus.MiniProtocol.ChainSync.Client.State (JumpInfo (..))
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Client.Replies
-  ( LeiosFetchClientContext (..)
+  ( BodyWork
+  , LeiosFetchClientContext (..)
   , submitForgedEb
   , withBodyWorkers
   )
@@ -242,7 +243,7 @@ newLeiosFetchKernel ::
   ( StrictMVar m (LeiosOutstanding (LeiosPeerLifetimeId peer)) ->
     W.Readiness m ->
     R.Runtime m (LeiosPeerLifetimeId peer) ->
-    Owned.OwnedWork m LeiosPoint (m ()) ->
+    Owned.OwnedWork m LeiosPoint (BodyWork m) ->
     (LeiosPoint -> STM m Bool) ->
     LeiosFetchClientContext m (LeiosPeerLifetimeId peer)
   ) ->
@@ -270,7 +271,7 @@ newLeiosFetchKernelFromState ::
   ( StrictMVar m (LeiosOutstanding (LeiosPeerLifetimeId peer)) ->
     W.Readiness m ->
     R.Runtime m (LeiosPeerLifetimeId peer) ->
-    Owned.OwnedWork m LeiosPoint (m ()) ->
+    Owned.OwnedWork m LeiosPoint (BodyWork m) ->
     (LeiosPoint -> STM m Bool) ->
     LeiosFetchClientContext m (LeiosPeerLifetimeId peer)
   ) ->
