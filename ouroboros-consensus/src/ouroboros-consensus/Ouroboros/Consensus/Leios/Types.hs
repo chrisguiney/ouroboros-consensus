@@ -58,7 +58,7 @@ module Ouroboros.Consensus.Leios.Types
   , forgedEbTxs
   , forgedEbTxsProtVer
   , forgeLeiosEb
-  , LeiosClosure (..)
+  , SerialisedEndorserBlock (..)
   , endorserBlockHash
   , endorserBlockReferences
   , encodeEndorserBlock
@@ -394,11 +394,15 @@ mkMajorProtVerMod v =
 unMajorProtVerMod :: MajorProtVerMod -> Word16
 unMajorProtVerMod (UnsafeMajorProtVerMod v) = v
 
--- | The bytes of an endorser block and of the transactions it references, in
--- order, as the LeiosDB stores them.
-data LeiosClosure = MkLeiosClosure
-  { closureEb :: !(Serialised EndorserBlock)
-  , closureTxs :: ![LeiosTx]
+-- | An endorser block as the LeiosDB stores it: the bytes of its endorsement
+-- and of the transactions that names, in order.
+--
+-- TODO: This name is deliberate with the intention rename the `EndorserBlock`
+-- (`Serialised` or not) as the "Endorsement". The endorsement + its transaction
+-- (closure) becomes then the EndorserBlock.
+data SerialisedEndorserBlock = MkSerialisedEndorserBlock
+  { serialisedEndorsement :: !(Serialised EndorserBlock)
+  , serialisedTransactions :: ![LeiosTx]
   }
 
 -- | The hash ranking blocks announce for the endorser block: that of its
