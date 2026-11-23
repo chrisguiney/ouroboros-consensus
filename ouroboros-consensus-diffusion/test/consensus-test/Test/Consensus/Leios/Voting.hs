@@ -196,11 +196,11 @@ tests =
     , testCase "the node records the transactions it validated in full" $ do
         let Outcome{validatedAfter} = runVoting voting
         validatedAfter @?= Map.singleton (txHashOf 0) EvenProtVer
-    , testCase "the node records the transactions it validated before one that does not decode" $ do
+    , testCase "the node validates no transaction of a closure with one that does not decode" $ do
         let Outcome{notVoted, validatedAfter} =
               runVoting voting{closures = [(2, someAnnouncingBlock, validTxs <> [invalidEbTx])]}
         notVoted @?= [EbInvalid (Text.pack (show invalidEbTxError))]
-        validatedAfter @?= Map.singleton (txHashOf 0) EvenProtVer
+        validatedAfter @?= Map.empty
     ]
 
 -- | What happens around the node: the announcements its upstream peers send

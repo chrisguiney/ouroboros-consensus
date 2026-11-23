@@ -126,26 +126,24 @@ validateClosureInMempool decodeTx parityIn assumeValidated cfg readTables wasVal
         )
         $ throwError ClosureOverCapacity
       when (length serialisedTransactions /= length references) $ throwError ClosureIncomplete
-      let (txs, undecodable) = decodePrefix decodeTx serialisedTransactions
-          txKeys = foldMap getTransactionKeySets txs
+      -- The fetch checked the bytes against the references, so a transaction
+      -- that does not decode is the block's fault: reject it before applying
+      -- any.
+      txs <- liftEither $ first invalid $ mapM decodeTx serialisedTransactions
+      let txKeys = foldMap getTransactionKeySets txs
           txHashes = map fst references
       values <- lift $ readTables txKeys
       validated <- lift $ wasValidated parity txHashes
-      outcome <-
-        lift $
-          applyClosure
-            cfg
-            assumeValidated
-            (recordValidated parity)
-            slot
-            parity
-            capacity
-            (applyMempoolDiffs values txKeys ticked)
-            (zip3 txHashes validated txs)
-      -- Even a closure that fails validated what came before the failure.
-      pure $ case (closureVerdict outcome, undecodable) of
-        (Right (), Just err) -> outcome{closureVerdict = Left (invalid err)}
-        _ -> outcome
+      lift $
+        applyClosure
+          cfg
+          assumeValidated
+          (recordValidated parity)
+          slot
+          parity
+          capacity
+          (applyMempoolDiffs values txKeys ticked)
+          (zip3 txHashes validated txs)
 
   rejected parity reason =
     MkLeiosClosureValidation
@@ -157,13 +155,6 @@ validateClosureInMempool decodeTx parityIn assumeValidated cfg readTables wasVal
 
   invalid :: Show e => e -> LeiosClosureInvalid
   invalid = ClosureInvalid . Text.pack . show
-
--- | The transactions up to the first that does not decode, and why it does
--- not, so that those before it are validated still.
-decodePrefix :: (a -> Either e b) -> [a] -> ([b], Maybe e)
-decodePrefix decode = foldr step ([], Nothing)
- where
-  step x rest = either (\err -> ([], Just err)) (\y -> first (y :) rest) (decode x)
 
 -- | Apply the transactions of a closure, one after the other, to the ledger
 -- state of the block that announced it, ticked to its slot, as a certificate
