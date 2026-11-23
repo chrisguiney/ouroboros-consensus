@@ -25,7 +25,7 @@ module Ouroboros.Consensus.NodeKernel
   ) where
 
 import Cardano.Base.FeatureFlags (CardanoFeatureFlag)
-import Cardano.Crypto.Leios (LeiosCert)
+import Cardano.Crypto.Leios (LeiosCert, LeiosSigningKey)
 import Cardano.Network.ConsensusMode (ConsensusMode (..))
 import Cardano.Network.LedgerStateJudgement (LedgerStateJudgement (..))
 import Cardano.Network.NodeToNode
@@ -58,7 +58,7 @@ import Data.Maybe.Strict (StrictMaybe)
 import Data.Set (Set)
 import qualified Data.Text as Text
 import Data.Time.Clock (NominalDiffTime)
-import Data.Void (Void)
+import Data.Void (Void, absurd)
 import Ouroboros.Consensus.Block hiding (blockMatchesHeader)
 import Ouroboros.Consensus.BlockchainTime
 import Ouroboros.Consensus.Config
@@ -648,17 +648,32 @@ initNodeKernel
       VotingEnv m blk ->
       STM m [MkBlockForging m blk] ->
       m Void
-    blockForgingController st onForgedEb votingEnv getBlockForging = go []
-     where
-      go :: [Thread m Void] -> m Void
-      go !forgingThreads = do
-        blockForging <- atomically getBlockForging
-        traverse_ cancelThread forgingThreads
-        blockForging' <-
-          traverse
-            (forkBlockProducer st onForgedEb votingEnv)
-            blockForging
-        go blockForging'
+    blockForgingController st onForgedEb votingEnv getBlockForging = do
+      votingKeys <- newTVarIO []
+      let go :: [Thread m Void] -> Maybe (Thread m ()) -> m Void
+          go !forgingThreads voting = do
+            blockForging <- atomically getBlockForging
+            traverse_ cancelThread forgingThreads
+            traverse_ cancelThread voting
+            atomically $ writeTVar votingKeys []
+            blockForging' <-
+              traverse
+                (forkBlockForging st onForgedEb (votingVoteState votingEnv) votingKeys)
+                blockForging
+            voting' <-
+              forkLinkedThread registry "NodeKernel.leiosVoting" $ do
+                -- Each forging thread adds the keys of its credentials, once
+                -- it holds them.
+                keysPerCredentials <- atomically $ do
+                  keys <- readTVar votingKeys
+                  check (length keys == length blockForging)
+                  pure keys
+                case concat keysPerCredentials of
+                  -- Nothing to vote with.
+                  [] -> pure ()
+                  keys -> absurd <$> runLeiosVoting votingEnv keys
+            go blockForging' (Just voting')
+      go [] Nothing
 
 castTraceFetchDecision ::
   forall remotePeer blk.
@@ -797,53 +812,51 @@ subscribeLeiosClosures acquisitions = do
           AcquiredEb{} -> nextClosure
   pure nextClosure
 
--- | Forge with a set of credentials, and vote with its BLS keys, if any.
-forkBlockProducer ::
+forkBlockForging ::
   forall m addrNTN addrNTC blk.
-  (IOLike m, SI.MonadTimer m, RunNode blk) =>
+  (IOLike m, RunNode blk) =>
   InternalState m addrNTN addrNTC blk ->
   -- | What 'forge' does with each endorser block it produces, given the
   -- wall-clock onset of the slot it forged it in
   (RelativeTime -> Header blk -> StrictMaybe LeiosLedgerView -> ForgedEndorserBlock -> m ()) ->
-  -- | Also where 'forge' looks up the certificate the node aggregated
-  VotingEnv m blk ->
+  -- | Where 'forge' looks up the certificate the node aggregated
+  VoteState m blk ->
+  -- | Where the credentials' BLS keys go, for the node's voter
+  StrictTVar m [[LeiosSigningKey]] ->
   MkBlockForging m blk ->
   m (Thread m Void)
-forkBlockProducer IS{..} onForgedEb votingEnv (MkBlockForging blockForgingM) =
-  forkLinkedThread registry label $ do
-    (key, bf) <- allocate registry (const blockForgingMLabel) finalize
-    withWatcher label (forging bf) (voting bf) `finally` release key
- where
-  forging bf = knownSlotWatcher btime $
-    \currentSlot slotOnset ->
-      withEarlyExit_ $
-        forge
-          (forgeTracer tracers)
-          (forgeStateInfoTracer tracers)
-          cfg
-          chainDB
-          mempool
-          bf
-          ( getLeiosCertToForge
-              (TraceLabelCreds (forgeLabel bf) >$< forgeTracer tracers)
+forkBlockForging IS{..} onForgedEb voteState votingKeys (MkBlockForging blockForgingM) =
+  forkLinkedWatcherAllocate
+    registry
+    label
+    blockForgingMLabel
+    finalize
+    ( \bf -> knownSlotWatcher btime $
+        \currentSlot slotOnset ->
+          withEarlyExit_ $
+            forge
+              (forgeTracer tracers)
+              (forgeStateInfoTracer tracers)
+              cfg
               chainDB
-              (votingVoteState votingEnv)
-          )
-          (onForgedEb slotOnset)
-          currentSlot
-
-  voting bf =
-    case leiosBLSKeys (Proxy @(BlockProtocol blk)) (canBeLeader bf) of
-      -- Nothing to vote with.
-      [] -> forever $ threadDelay 86400
-      keys -> runLeiosVoting votingEnv keys
-
+              mempool
+              bf
+              ( getLeiosCertToForge
+                  (TraceLabelCreds (forgeLabel bf) >$< forgeTracer tracers)
+                  chainDB
+                  voteState
+              )
+              (onForgedEb slotOnset)
+              currentSlot
+    )
+ where
   label :: String
   label = "NodeKernel.blockForging"
 
   blockForgingMLabel = do
     bf <- blockForgingM
     labelThisThread $ Text.unpack $ forgeLabel bf
+    atomically $ modifyTVar votingKeys (leiosBLSKeys (Proxy @(BlockProtocol blk)) (canBeLeader bf) :)
     pure bf
 
 -- | The certificate of the endorser block that the block at this point

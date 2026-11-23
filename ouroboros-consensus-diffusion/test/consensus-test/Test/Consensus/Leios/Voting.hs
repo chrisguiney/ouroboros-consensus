@@ -95,7 +95,7 @@ import Test.Consensus.Leios.TestBlock
   , successorLeiosBlock
   )
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, testCase, (@?=))
 import Test.Util.ChainDB (emptyNodeDBs)
 
 tests :: TestTree
@@ -125,13 +125,19 @@ tests =
         -- and by the end of the first's window it had voted in slot 2.
         notVoted @?= [Superseded 3]
     , testCase "the node votes with each of its keys that holds a seat" $ do
-        let Outcome{down} = runVoting voting{keys = take 2 seatKeys}
+        let Outcome{down} = runVoting voting{credentials = [take 2 seatKeys]}
         votes down @?= map (voteOf someAnnouncingBlock) [0, 1]
+    , testCase "the node votes once per election, with the seats of all its credentials" $ do
+        let Outcome{down, validated} = runVoting voting{credentials = [take 1 seatKeys, take 1 (drop 1 seatKeys)]}
+        -- In whichever order the credentials' threads add their keys.
+        length (votes down) @?= 2
+        for_ [0, 1] $ \seat -> assertBool "a vote per seat" (voteOf someAnnouncingBlock seat `elem` votes down)
+        length validated @?= 1
     , testCase "the node's votes count towards a certificate" $ do
-        let Outcome{certified} = runVoting voting{keys = seatKeys}
+        let Outcome{certified} = runVoting voting{credentials = [seatKeys]}
         fmap (const ()) certified @?= Just ()
     , testCase "the node does not vote with a key that holds no seat" $ do
-        let Outcome{down, notVoted} = runVoting voting{keys = [keyOfNoSeat]}
+        let Outcome{down, notVoted} = runVoting voting{credentials = [[keyOfNoSeat]]}
         votes down @?= []
         notVoted @?= [NotOnCommittee]
     , testCase "the node does not vote for an invalid endorser block" $ do
@@ -207,7 +213,8 @@ tests =
 -- it, when it adopts which blocks and acquires which closures, and how long it
 -- takes to validate a closure.
 data Voting = Voting
-  { keys :: [LeiosSigningKey]
+  { credentials :: [[LeiosSigningKey]]
+  -- ^ The BLS keys of each of the node's credentials.
   , ups :: [[(DiffTime, Notification)]]
   , adopts :: [(DiffTime, LeiosTestBlock)]
   , closures :: [(DiffTime, LeiosTestBlock, [BS.ByteString])]
@@ -223,7 +230,7 @@ data Voting = Voting
 voting :: Voting
 voting =
   Voting
-    { keys = take 1 seatKeys
+    { credentials = [take 1 seatKeys]
     , ups = [[announce someAnnouncingBlock]]
     , adopts = [(1.5, someAnnouncingBlock)]
     , closures = [(2, someAnnouncingBlock, validTxs)]
@@ -244,9 +251,9 @@ data Outcome = Outcome
   -- ^ The transactions the node validated, once it stopped.
   }
 
--- | Run the node with the given keys for 20 s.
+-- | Run the node with the given credentials for 20 s.
 runVoting :: Voting -> Outcome
-runVoting Voting{keys, ups, adopts, closures, validating, validatedBefore} = runSimOrThrow $ do
+runVoting Voting{credentials, ups, adopts, closures, validating, validatedBefore} = runSimOrThrow $ do
   traced <- newTVarIO []
   nodeDBs <- emptyNodeDBs
   leiosDB <- newLeiosDBInMemory
@@ -260,7 +267,7 @@ runVoting Voting{keys, ups, adopts, closures, validating, validatedBefore} = run
               atomically $ modifyTVar traced (ev :)
           }
   withNodeUnderTest (defaultNodeUnderTestConfig k ledgerConfig) tracers nodeDBs leiosDB $ \node -> do
-    setBlockForging (nodeKernel node) [MkBlockForging (pure (votingOnly keys))]
+    setBlockForging (nodeKernel node) [MkBlockForging (pure (votingOnly keys)) | keys <- credentials]
     withAsync (adopt node) $ \_ -> withAsync (acquire node) $ \_ -> do
       outcomes <-
         forConcurrently (zip [1 ..] (map (PeerSpec 0 []) ups <> [PeerSpec 0 [] []])) $ \(i, spec) ->
